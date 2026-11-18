@@ -166,6 +166,15 @@ private[orc] trait OrcTypeOps extends Serializable {
    * down regardless. Default is true.
    */
   def acceptsReadType(readType: DataType): Boolean = true
+
+  /**
+   * Whether a predicate with `value`, a filter literal before castFilterLiteral, is pushable
+   * (OrcFilters.buildLeafSearchArgument). ORC evaluates a pushed down predicate against its
+   * statistics, which it can change on read, e.g. convert the timestamps before 1582-10-15 to the
+   * proleptic Gregorian calendar, so this is false for a value that does not compare the same
+   * with them. Only meaningful for types that also return a predicateLeafType. Default is true.
+   */
+  def acceptsFilterValue(value: Any): Boolean = true
 }
 
 /**

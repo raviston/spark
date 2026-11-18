@@ -27,6 +27,7 @@ import org.apache.orc.mapred.OrcTimestamp
 
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.execution.datasources.orc.OrcFilters
 import org.apache.spark.sql.types.{DataType, TimestampLTZNanosType, TimestampNTZNanosType}
 import org.apache.spark.unsafe.types.TimestampNanosVal
 
@@ -103,6 +104,17 @@ case class TimestampLTZNanosOrcOps(t: TimestampLTZNanosType) extends OrcTypeOps 
     case r: TimestampLTZNanosType => r.precision >= t.precision
     case _ => false
   }
+
+  // ORC converts the statistics whose wall clock is before 1582-10-15 to the proleptic Gregorian
+  // calendar, while castFilterLiteral converts the value in the hybrid Julian/Gregorian calendar,
+  // which also moves a value from 1582-10-05 to 1582-10-14 by 10 days. So, as for TimestampType
+  // (see OrcFilters), a value whose wall clock is before 1582-10-17 is not pushed down. The wall
+  // clock that ORC compares is the instant's UTC wall clock (see castFilterLiteral).
+  override def acceptsFilterValue(value: Any): Boolean = value match {
+    case i: Instant =>
+      !LocalDateTime.ofInstant(i, ZoneOffset.UTC).isBefore(OrcFilters.MinPushedTimestampWallClock)
+    case _ => true
+  }
 }
 
 /**
@@ -175,5 +187,14 @@ case class TimestampNTZNanosOrcOps(t: TimestampNTZNanosType) extends OrcTypeOps 
   override def acceptsReadType(readType: DataType): Boolean = readType match {
     case r: TimestampNTZNanosType => r.precision >= t.precision
     case _ => false
+  }
+
+  // ORC converts the statistics whose wall clock is before 1582-10-15 to the proleptic Gregorian
+  // calendar, while castFilterLiteral converts the value in the hybrid Julian/Gregorian calendar,
+  // which also moves a value from 1582-10-05 to 1582-10-14 by 10 days. So, as for TimestampType
+  // (see OrcFilters), a value whose wall clock is before 1582-10-17 is not pushed down.
+  override def acceptsFilterValue(value: Any): Boolean = value match {
+    case ldt: LocalDateTime => !ldt.isBefore(OrcFilters.MinPushedTimestampWallClock)
+    case _ => true
   }
 }

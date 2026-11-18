@@ -184,11 +184,12 @@ private[sql] object OrcFilters extends OrcFiltersBase {
       .getOrElse(throw QueryExecutionErrors.unsupportedOperationForDataTypeError(dt))
   }
 
-  // 1582-10-17 00:00:00 in milliseconds, two days after ORC's `DateUtils.SWITCHOVER_MILLIS`. A
-  // TIMESTAMP value whose wall clock is before it is not pushed down, see
-  // `hasValueBeforeCalendarSwitch`.
+  // 1582-10-17 00:00:00, two days after ORC's `DateUtils.SWITCHOVER_MILLIS`. A timestamp value
+  // whose wall clock is before it is not pushed down, see `hasValueBeforeCalendarSwitch`.
+  private[orc] val MinPushedTimestampWallClock: LocalDateTime = LocalDateTime.of(1582, 10, 17, 0, 0)
+
   private val MinPushedTimestampWallClockMillis: Long =
-    LocalDate.of(1582, 10, 17).toEpochDay * MILLIS_PER_DAY
+    MinPushedTimestampWallClock.toLocalDate.toEpochDay * MILLIS_PER_DAY
 
   /**
    * Cast literal values for filters.
@@ -312,17 +313,22 @@ private[sql] object OrcFilters extends OrcFiltersBase {
     // before 1582-10-17 is not pushed down either.
     // ORC compares wall clocks in the JVM default time zone, and the wall clock is computed here
     // as in `SerializationUtils.convertToUtc`.
+    // The nanosecond timestamp types convert a pushed down value to the hybrid calendar as well,
+    // so they don't push down such values either, see `OrcTypeOps.acceptsFilterValue`.
     def hasValueBeforeCalendarSwitch(attribute: String, values: Seq[Any]): Boolean =
-      dataTypeMap.get(attribute).exists(_.fieldType == TimestampType) && {
-        val timeZone = TimeZone.getDefault
-        values.exists { v =>
-          castLiteralValue(v, TimestampType) match {
-            case ts: Timestamp =>
-              val millis = ts.getTime
-              millis + timeZone.getOffset(millis) < MinPushedTimestampWallClockMillis
-            case _ => false
+      dataTypeMap.get(attribute).map(_.fieldType).exists {
+        case TimestampType =>
+          val timeZone = TimeZone.getDefault
+          values.exists { v =>
+            castLiteralValue(v, TimestampType) match {
+              case ts: Timestamp =>
+                val millis = ts.getTime
+                millis + timeZone.getOffset(millis) < MinPushedTimestampWallClockMillis
+              case _ => false
+            }
           }
-        }
+        case OrcTypeOps(ops) => !values.forall(ops.acceptsFilterValue)
+        case _ => false
       }
 
     // The attribute and the values of a leaf predicate with values.

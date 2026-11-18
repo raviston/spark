@@ -609,10 +609,12 @@ class OrcFilterSuite extends OrcTest with SharedSparkSession {
   test("SPARK-57823: filter pushdown - nanosecond timestamp") {
     // Wall clocks carry sub-microsecond digits. The literal is explicitly nanos-typed, so even a
     // microsecond-aligned value would still exercise the nanos pushdown path; the extra digits
-    // exercise value preservation and comparison beyond microsecond precision.
+    // exercise value preservation and comparison beyond microsecond precision. A predicate with a
+    // value before 1582-10-17 is not pushed down, see SPARK-61366, so the values are from
+    // 1582-10-17 on.
     val wallClocks = Seq(
-      LocalDateTime.of(1000, 1, 1, 1, 2, 3, 456789123),
-      LocalDateTime.of(1582, 10, 1, 0, 11, 22, 456789123),
+      LocalDateTime.of(1582, 10, 17, 1, 2, 3, 456789123),
+      LocalDateTime.of(1600, 1, 1, 0, 11, 22, 456789123),
       LocalDateTime.of(1900, 1, 1, 23, 59, 59, 456789123),
       LocalDateTime.of(2020, 5, 25, 10, 11, 12, 456789123))
 
@@ -740,6 +742,121 @@ class OrcFilterSuite extends OrcTest with SharedSparkSession {
           ).foreach { filter =>
             assert(createFilter(filter).isDefined === (readPrecision >= filePrecision),
               s"$filter, $clue")
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-61366: filter pushdown - nanosecond timestamp before 1582-10-15") {
+    // As for TIMESTAMP (SPARK-60152), ORC compares a pushed down value in the hybrid
+    // Julian/Gregorian calendar with the statistics converted to the proleptic Gregorian calendar,
+    // which moves the ones whose wall clock is before 1582-10-15. So the pushed down predicates
+    // must not skip their files.
+    val values = Seq(
+      "0001-01-02 00:00:00",
+      "1500-01-01 00:00:00",
+      "1582-10-04 20:00:00",
+      "1582-10-15 00:00:00",
+      "1582-10-15 18:00:00",
+      "1582-10-16 23:59:59.999999999",
+      "2020-05-25 10:11:12.123456789")
+    // The dates from 1582-10-05 to 1582-10-14 don't exist in the hybrid calendar, and
+    // `java.sql.Timestamp.valueOf` moves a value on them by 10 days, e.g. 1582-10-10 18:00:00 to
+    // 1582-10-20 18:00:00, so they are only used in the conditions.
+    val conditionValues = values ++ Seq("1582-10-05 00:00:00", "1582-10-10 18:00:00")
+    // The time zones furthest ahead of and behind UTC as well.
+    val zones = timeZonesForCalendarSwitch ++ Seq("Pacific/Kiritimati", "Pacific/Pago_Pago")
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      Seq("TIMESTAMP_LTZ(9)", "TIMESTAMP_NTZ(9)").foreach { tsType =>
+        def lit(v: String): String = s"CAST('$v' AS $tsType)"
+        val later = lit("2020-05-25 10:11:12.123456789")
+        val conditions = conditionValues.flatMap { v =>
+          Seq("=", "<=>", "<", "<=", ">", ">=", "!=").map(op => s"t $op ${lit(v)}") ++ Seq(
+            s"NOT (t <=> ${lit(v)})",
+            s"t IN (${lit(v)}, $later)",
+            s"t IN (${lit(v)}, NULL)",
+            s"t = ${lit(v)} OR t > $later")
+        }
+        zones.foreach { zone =>
+          withDefaultTimeZone(ZoneId.of(zone)) {
+            withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> zone) {
+              val inMemory =
+                sql(values.map(v => s"SELECT ${lit(v)} AS t").mkString(" UNION ALL "))
+              val expected = conditions.map(c => c -> inMemory.where(c).count())
+              withTempPath { dir =>
+                val path = dir.getCanonicalPath
+                // One file per value, so the statistics of a file hold only its value.
+                values.foreach { v =>
+                  sql(s"SELECT ${lit(v)} AS t").write.mode("append").orc(path)
+                }
+                withAllNativeOrcReaders {
+                  val df = spark.read.orc(path)
+                  expected.foreach { case (condition, count) =>
+                    assert(df.where(condition).count() === count, s"$condition, time zone $zone")
+                  }
+                  // Predicates with a later value are still pushed down and skip the other files.
+                  // For TIMESTAMP_LTZ the UTC wall clock counts, and 1582-10-17 00:00:00 in a time
+                  // zone ahead of UTC is before 1582-10-17 in UTC, so the value is a day later.
+                  assert(stripSparkFilter(df.where(s"t = $later")).count() === 1, zone)
+                  assert(stripSparkFilter(df.where(s"t > ${lit("1582-10-18 00:00:00")}")).count()
+                    === 1, zone)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-61366: nanosecond timestamp predicates with a value before 1582-10-17 are not " +
+      "pushed down") {
+    import org.apache.spark.sql.sources._
+    val schema = new StructType()
+      .add("ltz", TimestampLTZNanosType(9))
+      .add("ntz", TimestampNTZNanosType(9))
+    def createFilter(filter: Filter): Option[SearchArgument] =
+      OrcFilters.createFilter(schema, Seq(filter))
+    // The filter values: an Instant for TIMESTAMP_LTZ, whose UTC wall clock is what counts (see
+    // `TimestampLTZNanosOrcOps.castFilterLiteral`), and a LocalDateTime for TIMESTAMP_NTZ.
+    def values(wallClock: String): Seq[(String, Any)] = {
+      val ldt = LocalDateTime.parse(wallClock)
+      Seq("ltz" -> ldt.toInstant(ZoneOffset.UTC), "ntz" -> ldt)
+    }
+    timeZonesForCalendarSwitch.foreach { zone =>
+      withDefaultTimeZone(ZoneId.of(zone)) {
+        Seq(
+          "0001-01-02T00:00:00" -> false,
+          "1500-01-01T00:00:00" -> false,
+          "1582-10-04T23:59:59.999999999" -> false,
+          // `java.sql.Timestamp.valueOf` moves this value to 1582-10-20 18:00:00.
+          "1582-10-10T18:00:00" -> false,
+          "1582-10-15T01:00:00" -> false,
+          "1582-10-16T23:59:59.999999999" -> false,
+          "1582-10-17T00:00:00" -> true,
+          "1900-01-01T00:00:00" -> true
+        ).foreach { case (wallClock, pushed) =>
+          values(wallClock).zip(values("2020-05-25T10:11:12")).foreach {
+            case ((name, value), (_, later)) =>
+              Seq(
+                EqualTo(name, value),
+                EqualNullSafe(name, value),
+                Not(EqualTo(name, value)),
+                LessThan(name, value),
+                LessThanOrEqual(name, value),
+                GreaterThan(name, value),
+                GreaterThanOrEqual(name, value),
+                In(name, Array[Any](value)),
+                In(name, Array[Any](later, value)),
+                In(name, Array[Any](value, null)),
+                Or(EqualTo(name, value), GreaterThan(name, later))
+              ).foreach { filter =>
+                assert(createFilter(filter).isDefined === pushed, s"$filter, time zone $zone")
+              }
+              // The other parts of a conjunction are still pushed down.
+              assert(createFilter(And(EqualTo(name, value), EqualTo(name, later))).isDefined)
+              assert(createFilter(IsNull(name)).isDefined)
           }
         }
       }
